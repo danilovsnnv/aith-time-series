@@ -1,24 +1,35 @@
-from functools import lru_cache
-from typing import Optional, Literal
+from typing import Any
 from pathlib import Path
+
+import yaml
 
 from pydantic.v1 import BaseSettings
 
 
 class PipelineConfig(BaseSettings):
     h: int
+    models: str | list[str]
+    models_params: list[dict[str, Any]]
     data_path: Path
     id_column: str
     date_column: str
     target_column: str
+    freq: str
+    features_columns: list[str] | None = None
     min_date: str | None = None
     max_date: str | None = None
-    freq: Literal['d', 'w', 'mo', 'q', 'y'] | None = None
+    metric_names: str | list[str] | None = None
 
     class Config:
         # env_prefix = 'PIPELINE_'
         case_sensitive = False
 
-@lru_cache
-def get_pipeline_config(**kwargs) -> PipelineConfig:
-    return PipelineConfig(**kwargs)
+    @classmethod
+    def from_yaml(cls, config_path: str | Path):
+        config_file = Path(config_path)
+        if not config_file.exists():
+            raise FileNotFoundError(f'Config file `{config_path}` not found.')
+        with config_file.open('r') as f:
+            data = yaml.safe_load(f)
+
+        return cls(**data)
