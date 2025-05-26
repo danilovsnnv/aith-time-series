@@ -1,0 +1,12 @@
+h: 90
+models: ['AutoARIMA', 'GARCH', 'ARIMA']
+models_params: []
+data_path: ../data/shop_sales.csv
+id_column: item_id
+date_column: date_id
+target_column: cnt
+features_columns: []
+min_date: null
+max_date: null
+metric_names: ['mean_absolute_error', 'mean_absolute_percentage_error']
+freq: 1d
