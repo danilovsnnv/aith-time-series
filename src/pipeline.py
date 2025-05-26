@@ -2,42 +2,45 @@ from __future__ import annotations
 
 from functools import cached_property
 
+import pandas as pd
 import polars as pl
-from typing import Any, Literal
+from typing import Any
 from pathlib import Path
 
-from pydantic.v1 import BaseSettings
 from sklearn import metrics as sklearn_metrics
-from statsforecast import StatsForecast
+from statsforecast import StatsForecast, models as sf_models
+
+from src.config import PipelineConfig
 
 
 class Pipeline:
     def __init__(
         self,
-        h: int,
-        data_path: Path | str,
-        id_column: str,
-        date_column: str,
-        target_column: str,
-        features_columns: list[str] | None = None,
-        min_date: str | None = None,
-        max_date: str | None = None,
-        freq: Literal['d', 'w', 'mo', 'q', 'y'] | None = None,
+        config: PipelineConfig,
     ):
-        if isinstance(data_path, str):
-            data_path = Path(data_path)
+        if isinstance(config.data_path, str):
+            config.data_path = Path(config.data_path)
 
-        self.data_path = data_path
-        self.id_column = id_column
-        self.date_column = date_column
-        self.target_column = target_column
-        self.feature_columns = features_columns or []
+        self.data_path = config.data_path
+        self.id_column = config.id_column
+        self.date_column = config.date_column
+        self.target_column = config.target_column
+        self.feature_columns = config.features_columns or []
 
-        self.min_date = min_date
-        self.max_date = max_date
-        self.freq = freq
+        self.min_date = config.min_date
+        self.max_date = config.max_date
+        self.freq = config.freq
 
-        self.h = h
+        self.h = config.h
+        self.models = config.models
+
+        self.metric_names = config.metric_names or ['mean_absolute_percentage_error']
+
+        if isinstance(self.models, str):
+            self.models = [self.models]
+
+        if isinstance(self.metric_names, str):
+            self.metric_names = [self.metric_names]
 
         self._fitted = False
 
@@ -62,43 +65,54 @@ class Pipeline:
         }
 
     @classmethod
-    def from_config(cls, config: BaseSettings) -> Pipeline:
-        return Pipeline(**config.dict())
+    def from_config(cls, config: PipelineConfig) -> Pipeline:
+        return Pipeline(config)
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> Pipeline:
-        return Pipeline(**config)
+        return Pipeline(PipelineConfig(**config))
 
     def read_data(
         self,
         filters: dict[str, Any] | None = None,
     ) -> pl.DataFrame:
-        if not filters:
-            filters = {}
+        if self.data_path.suffix == '.csv':
+            data = pl.read_csv(self.data_path)
+        elif self.data_path.suffix == '.parquet':
+            read_columns = [self.id_column, self.date_column, self.target_column, *self.feature_columns]
+            data = pl.read_parquet(
+                self.data_path, use_pyarrow=True, columns=read_columns, pyarrow_options={'filter': filters}
+            )
+        else:
+            raise NotImplementedError('Only CSV and parquet supported')
 
-        data = pl.read_csv(self.data_path, use_pyarrow=True, pyarrow_options={'filters': filters})
         return data
 
 
     def process_data(self, data):
         data = data.with_columns(pl.col(self.date_column).cast(pl.Date))
-        data = data.rename({})
+        data = data.rename(self._rename_dict)
+        data = data.select(
+            self._id_column_alias,
+            self._date_column_alias,
+            self._target_column_alias,
+            *self.feature_columns
+        )
+        return data
 
     def train_test_split(self, df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
-        min_date = self.min_date or df[self.date_column].min()
-        max_date = self.max_date or df[self.date_column].max()
+        min_date = self.min_date or df[self._date_column_alias].min()
+        max_date = self.max_date or df[self._date_column_alias].max()
 
-        split_date = df.select(
-            (max_date - pl.duration(**{self.freq: self.h}))
-        ).item(0, 0)
+        split_date = pl.lit(max_date).dt.offset_by(f'-{self.h}{self.freq}')
 
         train_df = df.filter(
-            (pl.col(self.date_column) > min_date) &
-            (pl.col(self.date_column) <= split_date)
+            (pl.col(self._date_column_alias) > pd.to_datetime(min_date)) &
+            (pl.col(self._date_column_alias) <= split_date)
         )
         test_df = df.filter(
-            (pl.col(self.date_column) > split_date) &
-            (pl.col(self.date_column) <= max_date)
+            (pl.col(self._date_column_alias) > split_date) &
+            (pl.col(self._date_column_alias) <= pd.to_datetime(max_date))
         )
 
         return train_df, test_df
@@ -106,14 +120,15 @@ class Pipeline:
     def fit(self, data: pl.DataFrame) -> StatsForecast:
         if self._fitted:
             raise RuntimeError(f'Pipeline is already fitted')
-        forecaster = StatsForecast(models=[], freq=self.freq)
+        models = [getattr(sf_models, model_name)() for model_name in self.models]
+        forecaster = StatsForecast(models=models, freq=self.freq)
         forecaster.fit(data)
         self._fitted = True
         return forecaster
 
     def predict(self, forecaster: StatsForecast) -> pl.DataFrame:
-        if self._fitted:
-            raise RuntimeError(f'Pipeline is already fitted')
+        if not self._fitted:
+            raise RuntimeError(f'Pipeline is not fitted')
         predict = forecaster.predict(h=self.h)
         return predict
 
@@ -129,35 +144,32 @@ class Pipeline:
         self,
         y_true: pl.DataFrame,
         y_pred: pl.DataFrame,
-        metric_names: str | list[str] = 'mean_absolute_percentage_error',
     ) -> pl.DataFrame:
-        if isinstance(metric_names, str):
-            metric_names = [metric_names]
-
         joined = y_true.join(
             y_pred,
-            on=[self.id_column, self.date_column],
-            suffix='_pred'
+            on=[self._id_column_alias, self._date_column_alias],
         )
 
-        y = joined[self.target_column].to_numpy()
-        y_hat = joined[f'{self.target_column}_pred'].to_numpy()
+        metrics_list: list[dict[str, Any]] = []
+        pred_columns: list[str] = list(set(y_pred.columns) - {self._id_column_alias, self._date_column_alias})
 
-        metrics_dict = {}
+        for model_name in pred_columns:
+            y = joined[self._target_column_alias].to_numpy()
+            y_hat = joined[model_name].to_numpy()
+            model_metrics = {'model': model_name}
+            for metric_name in self.metric_names:
+                metric_fn = getattr(sklearn_metrics, metric_name)
+                model_metrics[metric_name] = metric_fn(y, y_hat)
 
-        for metric in metric_names:
-            metric_fn = getattr(sklearn_metrics, metric)
-            metrics_dict[metric] = metric_fn(y, y_hat)
+            metrics_list.append(model_metrics)
 
-        metrics_df = pl.DataFrame(metrics_dict)
-
-        return metrics_df
+        return pl.DataFrame(metrics_list)
 
     def run(self):
         data = self.read_data()
+        data = self.process_data(data)
         train_df, test_df = self.train_test_split(data)
         forecaster = self.fit(train_df)
         predict = self.predict(forecaster)
         metrics = self.calc_metrics(test_df, predict)
         print(metrics)
-
