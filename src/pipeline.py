@@ -21,6 +21,9 @@ class Pipeline:
         if isinstance(config.data_path, str):
             config.data_path = Path(config.data_path)
 
+        if isinstance(config.checkpoint_path, str):
+            config.checkpoint_path = Path(config.checkpoint_path)
+
         self.data_path = config.data_path
         self.id_column = config.id_column
         self.date_column = config.date_column
@@ -33,7 +36,9 @@ class Pipeline:
 
         self.h = config.h
         self.models = config.models
+        self.checkpoint_path = config.checkpoint_path
 
+        self.mode = config.mode
         self.metric_names = config.metric_names or ['mean_absolute_percentage_error']
 
         if isinstance(self.models, str):
@@ -100,9 +105,16 @@ class Pipeline:
         )
         return data
 
-    def train_test_split(self, df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    def train_test_split(self, df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame | None]:
         min_date = self.min_date or df[self._date_column_alias].min()
         max_date = self.max_date or df[self._date_column_alias].max()
+
+        if self.mode == 'inference':
+            train_df = df.filter(
+                (pl.col(self._date_column_alias) > pd.to_datetime(min_date)) &
+                (pl.col(self._date_column_alias) <= pd.to_datetime(max_date))
+            )
+            return train_df, None
 
         split_date = pl.lit(max_date).dt.offset_by(f'-{self.h}{self.freq}')
 
@@ -169,7 +181,13 @@ class Pipeline:
         data = self.read_data()
         data = self.process_data(data)
         train_df, test_df = self.train_test_split(data)
-        forecaster = self.fit(train_df)
+        if self.checkpoint_path:
+            forecaster = self.load(self.checkpoint_path)
+        else:
+            forecaster = self.fit(train_df)
+
         predict = self.predict(forecaster)
-        metrics = self.calc_metrics(test_df, predict)
-        print(metrics)
+
+        if self.mode == 'valid':
+            metrics = self.calc_metrics(test_df, predict)
+            print(metrics)

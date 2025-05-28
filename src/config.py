@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 from pathlib import Path
 
 import yaml
@@ -10,12 +10,14 @@ class PipelineConfig(BaseSettings):
     h: int
     models: str | list[str]
     models_params: list[dict[str, Any]]
-    data_path: Path
+    data_path: Path | str
     id_column: str
     date_column: str
     target_column: str
     freq: str
+    mode: Literal['valid', 'inference'] = 'valid'
     features_columns: list[str] | None = None
+    checkpoint_path: Path | str | None = None
     min_date: str | None = None
     max_date: str | None = None
     metric_names: str | list[str] | None = None

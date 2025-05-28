@@ -1,4 +1,5 @@
 h: 90
+mode: 'inference'
 models: ['AutoARIMA', 'GARCH', 'ARIMA']
 models_params: []
 data_path: ../data/shop_sales.csv
