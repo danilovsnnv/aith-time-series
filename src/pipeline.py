@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import logging
 from functools import cached_property
 
 import pandas as pd
 import polars as pl
 from typing import Any
 from pathlib import Path
-
 from sklearn import metrics as sklearn_metrics
 from statsforecast import StatsForecast, models as sf_models
 
@@ -43,6 +43,17 @@ class Pipeline:
         self.log_dir = Path(config.log_dir)
         self.experiment_dir = self.log_dir / f'experiment_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
         self.experiment_dir.mkdir(parents=True, exist_ok=True)
+
+        log_file = self.experiment_dir / 'pipeline.log'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[%(asctime)s | %(levelname)s | %(name)s] %(message)s',
+            handlers=[
+                logging.FileHandler(log_file, mode='a'),
+                logging.StreamHandler()
+            ],
+        )
+        self.logger = logging.getLogger(self.__class__.__name__)
         config.to_yaml(self.experiment_dir / 'config.yaml')
 
         self.mode = config.mode
@@ -88,6 +99,7 @@ class Pipeline:
         self,
         filters: dict[str, Any] | None = None,
     ) -> pl.DataFrame:
+        self.logger.info('Reading data from %s', self.data_path)
         if self.data_path.suffix == '.csv':
             data = pl.read_csv(self.data_path)
         elif self.data_path.suffix == '.parquet':
@@ -98,10 +110,12 @@ class Pipeline:
         else:
             raise NotImplementedError('Only CSV and parquet supported')
 
+        self.logger.info('Data shape after reading: %s', data.shape)
         return data
 
 
     def process_data(self, data):
+        self.logger.info('Processing data')
         data = data.with_columns(pl.col(self.date_column).cast(pl.Date))
         data = data.rename(self._rename_dict)
         data = data.select(
@@ -110,9 +124,11 @@ class Pipeline:
             self._target_column_alias,
             *self.feature_columns
         )
+        self.logger.info('Data shape after processing: %s', data.shape)
         return data
 
     def train_test_split(self, df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame | None]:
+        self.logger.info('Splitting data into train and test sets')
         min_date = self.min_date or df[self._date_column_alias].min()
         max_date = self.max_date or df[self._date_column_alias].max()
 
@@ -120,6 +136,11 @@ class Pipeline:
             train_df = df.filter(
                 (pl.col(self._date_column_alias) > pd.to_datetime(min_date)) &
                 (pl.col(self._date_column_alias) <= pd.to_datetime(max_date))
+            )
+            self.logger.info(
+                'Train shape: %s, Test shape: %s',
+                train_df.shape,
+                None,
             )
             return train_df, None
 
@@ -133,10 +154,16 @@ class Pipeline:
             (pl.col(self._date_column_alias) > split_date) &
             (pl.col(self._date_column_alias) <= pd.to_datetime(max_date))
         )
+        self.logger.info(
+            'Train shape: %s, Test shape: %s',
+            train_df.shape,
+            None if test_df is None else test_df.shape,
+        )
 
         return train_df, test_df
 
     def fit(self, data: pl.DataFrame) -> StatsForecast:
+        self.logger.info('Fitting models: %s', self.models)
         if self._fitted:
             raise RuntimeError(f'Pipeline is already fitted')
         models = [
@@ -149,6 +176,7 @@ class Pipeline:
         return forecaster
 
     def predict(self, forecaster: StatsForecast) -> pl.DataFrame:
+        self.logger.info('Predicting with horizon %s', self.h)
         if not self._fitted:
             raise RuntimeError(f'Pipeline is not fitted')
         predict = forecaster.predict(h=self.h)
@@ -167,6 +195,7 @@ class Pipeline:
         y_true: pl.DataFrame,
         y_pred: pl.DataFrame,
     ) -> pl.DataFrame:
+        self.logger.info('Calculating metrics')
         joined = y_true.join(
             y_pred,
             on=[self._id_column_alias, self._date_column_alias],
@@ -193,6 +222,7 @@ class Pipeline:
         forecaster: StatsForecast,
         metrics: pl.DataFrame | None = None,
     ) -> None:
+        self.logger.info('Saving artifacts to %s', self.experiment_dir)
         predict.write_parquet(self.experiment_dir / 'prediction.parquet')
 
         if metrics is not None:
@@ -202,6 +232,7 @@ class Pipeline:
             self.save(forecaster, self.experiment_dir / 'forecaster.pk')
 
     def run(self):
+        self.logger.info('Starting pipeline run in "%s" mode', self.mode)
         data = self.read_data()
         data = self.process_data(data)
         train_df, test_df = self.train_test_split(data)
@@ -215,5 +246,7 @@ class Pipeline:
         metrics = None
         if self.mode == 'valid':
             metrics = self.calc_metrics(test_df, predict)
+            self.logger.info('Starting pipeline run in "%s" mode', self.mode)
 
         self.save_artifacts(predict, forecaster, metrics)
+        self.logger.info('Pipeline run completed')
