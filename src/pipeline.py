@@ -11,6 +11,7 @@ from sklearn import metrics as sklearn_metrics
 from statsforecast import StatsForecast, models as sf_models
 
 from src.config import PipelineConfig
+from datetime import datetime
 
 
 class Pipeline:
@@ -24,7 +25,7 @@ class Pipeline:
         if isinstance(config.checkpoint_path, str):
             config.checkpoint_path = Path(config.checkpoint_path)
 
-        self.data_path = config.data_path
+        self.data_path = Path(config.data_path)
         self.id_column = config.id_column
         self.date_column = config.date_column
         self.target_column = config.target_column
@@ -36,7 +37,13 @@ class Pipeline:
 
         self.h = config.h
         self.models = config.models
+        self.models_params = config.models_params
         self.checkpoint_path = config.checkpoint_path
+
+        self.log_dir = Path(config.log_dir)
+        self.experiment_dir = self.log_dir / f'experiment_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        self.experiment_dir.mkdir(parents=True, exist_ok=True)
+        config.to_yaml(self.experiment_dir / 'config.yaml')
 
         self.mode = config.mode
         self.metric_names = config.metric_names or ['mean_absolute_percentage_error']
@@ -132,7 +139,10 @@ class Pipeline:
     def fit(self, data: pl.DataFrame) -> StatsForecast:
         if self._fitted:
             raise RuntimeError(f'Pipeline is already fitted')
-        models = [getattr(sf_models, model_name)() for model_name in self.models]
+        models = [
+            getattr(sf_models, model_name)(**model_params)
+            for model_name, model_params in zip(self.models, self.models_params, strict=True)
+        ]
         forecaster = StatsForecast(models=models, freq=self.freq)
         forecaster.fit(data)
         self._fitted = True
@@ -177,6 +187,20 @@ class Pipeline:
 
         return pl.DataFrame(metrics_list)
 
+    def save_artifacts(
+        self,
+        predict: pl.DataFrame,
+        forecaster: StatsForecast,
+        metrics: pl.DataFrame | None = None,
+    ) -> None:
+        predict.write_parquet(self.experiment_dir / 'prediction.parquet')
+
+        if metrics is not None:
+            metrics.write_csv(self.experiment_dir / 'metrics.csv')
+
+        if not self.checkpoint_path:
+            self.save(forecaster, self.experiment_dir / 'forecaster.pk')
+
     def run(self):
         data = self.read_data()
         data = self.process_data(data)
@@ -188,6 +212,8 @@ class Pipeline:
 
         predict = self.predict(forecaster)
 
+        metrics = None
         if self.mode == 'valid':
             metrics = self.calc_metrics(test_df, predict)
-            print(metrics)
+
+        self.save_artifacts(predict, forecaster, metrics)

@@ -1,8 +1,9 @@
 h: 90
-mode: 'inference'
+mode: 'valid'
 models: ['AutoARIMA', 'GARCH', 'ARIMA']
-models_params: []
+models_params: [{}, {}, {'alias': 'BaseARIMA'}]
 data_path: ../data/shop_sales.csv
+log_dir: ../logs
 id_column: item_id
 date_column: date_id
 target_column: cnt

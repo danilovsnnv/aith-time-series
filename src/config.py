@@ -16,6 +16,7 @@ class PipelineConfig(BaseSettings):
     target_column: str
     freq: str
     mode: Literal['valid', 'inference'] = 'valid'
+    log_dir: Path | str
     features_columns: list[str] | None = None
     checkpoint_path: Path | str | None = None
     min_date: str | None = None
@@ -31,7 +32,16 @@ class PipelineConfig(BaseSettings):
         config_file = Path(config_path)
         if not config_file.exists():
             raise FileNotFoundError(f'Config file `{config_path}` not found.')
+
         with config_file.open('r') as f:
             data = yaml.safe_load(f)
 
         return cls(**data)
+
+    def to_yaml(self, save_path: str | Path):
+        save_path = Path(save_path)
+
+        str_config = {k: str(v) for k,v in self.dict().items()}
+
+        with save_path.open('w') as yaml_file:
+            yaml.safe_dump(str_config, yaml_file, sort_keys=False)
