@@ -1,0 +1,47 @@
+h: 30
+mode: 'valid'
+models:
+  - name: 'NBEATS'
+    params:
+      h: 30
+      input_size: 60
+      max_steps: 500
+      early_stop_patience_steps: 5
+      val_check_steps: 10
+      batch_size: 4
+      windows_batch_size: null
+      scaler_type: robust
+
+  - name: 'KAN'
+    params:
+      h: 30
+      input_size: 60
+      max_steps: 500
+      early_stop_patience_steps: 5
+      val_check_steps: 10
+      batch_size: 4
+      windows_batch_size: null
+      scaler_type: robust
+
+#  - name: 'AutoTFT'
+#    params:
+#      h: 30
+#      input_size: 60
+#      hidden_size: 16
+#      max_steps: 500
+#      early_stop_patience_steps: 5
+#      val_check_steps: 10
+#      batch_size: 4
+#      windows_batch_size: null
+#      scaler_type: robust
+
+data_path: ../data/shop_sales.csv
+log_dir: ../logs
+id_column: item_id
+date_column: date_id
+target_column: cnt
+features_columns: []
+min_date: null
+max_date: null
+metric_names: ['mean_absolute_error', 'mean_absolute_percentage_error']
+freq: 1d

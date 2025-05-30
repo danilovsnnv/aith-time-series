@@ -1,15 +1,14 @@
-from typing import Any, Literal
+from typing import Any, Literal, Type
 from pathlib import Path
 
 import yaml
 
-from pydantic.v1 import BaseSettings
+from pydantic.v1 import BaseSettings, validator
 
 
 class PipelineConfig(BaseSettings):
     h: int
-    models: str | list[str]
-    models_params: list[dict[str, Any]]
+    models: list[dict[str, Any]]
     data_path: Path | str
     id_column: str
     date_column: str

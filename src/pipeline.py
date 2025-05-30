@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
+from abc import ABC, abstractmethod
 
 import pandas as pd
 import polars as pl
@@ -9,12 +10,16 @@ from typing import Any
 from pathlib import Path
 from sklearn import metrics as sklearn_metrics
 from statsforecast import StatsForecast, models as sf_models
+from neuralforecast import NeuralForecast, models as nf_models
 
 from src.config import PipelineConfig
 from datetime import datetime
 
 
-class Pipeline:
+class Pipeline(ABC):
+    _forecaster_class: Any = None
+    _models_lib: Any = None
+
     def __init__(
         self,
         config: PipelineConfig,
@@ -37,11 +42,11 @@ class Pipeline:
 
         self.h = config.h
         self.models = config.models
-        self.models_params = config.models_params
         self.checkpoint_path = config.checkpoint_path
 
         self.log_dir = Path(config.log_dir)
-        self.experiment_dir = self.log_dir / f'experiment_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        experiment_name = f'{self._forecaster_class.__name__.lower()}_experiment_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        self.experiment_dir = self.log_dir / experiment_name
         self.experiment_dir.mkdir(parents=True, exist_ok=True)
 
         log_file = self.experiment_dir / 'pipeline.log'
@@ -58,9 +63,6 @@ class Pipeline:
 
         self.mode = config.mode
         self.metric_names = config.metric_names or ['mean_absolute_percentage_error']
-
-        if isinstance(self.models, str):
-            self.models = [self.models]
 
         if isinstance(self.metric_names, str):
             self.metric_names = [self.metric_names]
@@ -87,13 +89,13 @@ class Pipeline:
             self.target_column: self._target_column_alias,
         }
 
-    @classmethod
-    def from_config(cls, config: PipelineConfig) -> Pipeline:
-        return Pipeline(config)
+    @abstractmethod
+    @cached_property
+    def _fit_kwargs(self) -> dict[str, Any]: ...
 
-    @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> Pipeline:
-        return Pipeline(PipelineConfig(**config))
+    @abstractmethod
+    @cached_property
+    def _predict_kwargs(self) -> dict[str, Any]: ...
 
     def read_data(
         self,
@@ -162,16 +164,17 @@ class Pipeline:
 
         return train_df, test_df
 
-    def fit(self, data: pl.DataFrame) -> StatsForecast:
-        self.logger.info('Fitting models: %s', self.models)
+    def fit(self, data: pl.DataFrame):
+        self.logger.info('Fitting models: %s', [model['name'] for model in self.models])
         if self._fitted:
-            raise RuntimeError(f'Pipeline is already fitted')
+            raise RuntimeError('Pipeline is already fitted')
+
         models = [
-            getattr(sf_models, model_name)(**model_params)
-            for model_name, model_params in zip(self.models, self.models_params, strict=True)
+            getattr(self._models_lib, model['name'])(**model.get('params', {}))
+            for model in self.models
         ]
-        forecaster = StatsForecast(models=models, freq=self.freq)
-        forecaster.fit(data)
+        forecaster = self._forecaster_class(models=models, freq=self.freq)
+        forecaster.fit(data, **self._fit_kwargs)
         self._fitted = True
         return forecaster
 
@@ -179,16 +182,16 @@ class Pipeline:
         self.logger.info('Predicting with horizon %s', self.h)
         if not self._fitted:
             raise RuntimeError(f'Pipeline is not fitted')
-        predict = forecaster.predict(h=self.h)
+        predict = forecaster.predict(**self._predict_kwargs)
         return predict
 
     @staticmethod
-    def save(forecaster: StatsForecast, path: str | Path) -> None:
-        forecaster.save(path)
+    def save(forecaster, path: str | Path) -> None:
+        forecaster.save(str(path))
 
     @staticmethod
-    def load(path: Path) -> StatsForecast:
-        return StatsForecast.load(path)
+    @abstractmethod
+    def load(path: Path): ...
 
     def calc_metrics(
         self,
@@ -246,7 +249,42 @@ class Pipeline:
         metrics = None
         if self.mode == 'valid':
             metrics = self.calc_metrics(test_df, predict)
-            self.logger.info('Starting pipeline run in "%s" mode', self.mode)
+            self.logger.info('Prediction metrics')
+            self.logger.info("\n%s", metrics.to_pandas().to_markdown(index=False))
 
         self.save_artifacts(predict, forecaster, metrics)
         self.logger.info('Pipeline run completed')
+
+
+class StatsForecastPipeline(Pipeline):
+    _forecaster_class = StatsForecast
+    _models_lib = sf_models
+
+    @cached_property
+    def _fit_kwargs(self) -> dict[str, Any]:
+        return {}
+
+    @cached_property
+    def _predict_kwargs(self) -> dict[str, Any]:
+        return {'h': self.h}
+
+    @staticmethod
+    def load(path: Path) -> StatsForecast:
+        return StatsForecast.load(path)
+
+
+class NeuralForecastPipeline(Pipeline):
+    _forecaster_class = NeuralForecast
+    _models_lib = nf_models
+
+    @cached_property
+    def _fit_kwargs(self) -> dict[str, Any]:
+        return {'val_size': self.h}
+
+    @cached_property
+    def _predict_kwargs(self) -> dict[str, Any]:
+        return {}
+
+    @staticmethod
+    def load(path: Path) -> NeuralForecast:
+        return NeuralForecast.load(str(path))

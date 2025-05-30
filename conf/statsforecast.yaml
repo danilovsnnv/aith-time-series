@@ -1,0 +1,33 @@
+h: 30
+mode: 'valid'
+models:
+  - name: 'AutoARIMA'
+    params:
+      season_length: 30
+      max_p: 7
+      max_q: 7
+  - name: 'AutoTheta'
+  - name: 'HoltWinters'
+    params:
+      season_length: 30
+  - name: 'GARCH'
+    params:
+      p: 7
+      q: 7
+  - name: 'CrostonClassic'
+  - name: 'Naive'
+  - name: 'WindowAverage'
+    params:
+      window_size: 7
+      alias: 'WeekAverage'
+
+data_path: ../data/shop_sales.csv
+log_dir: ../logs
+id_column: item_id
+date_column: date_id
+target_column: cnt
+features_columns: []
+min_date: null
+max_date: null
+metric_names: ['mean_absolute_error', 'mean_absolute_percentage_error']
+freq: 1d
