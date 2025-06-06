@@ -21,6 +21,7 @@ class PipelineConfig(BaseSettings):
     min_date: str | None = None
     max_date: str | None = None
     metric_names: str | list[str] | None = None
+    boxcox: bool | None = False
 
     class Config:
         # env_prefix = 'PIPELINE_'

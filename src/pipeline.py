@@ -8,6 +8,8 @@ import pandas as pd
 import polars as pl
 from typing import Any
 from pathlib import Path
+from scipy.stats import boxcox
+from scipy.special import inv_boxcox
 from sklearn import metrics as sklearn_metrics
 from statsforecast import StatsForecast, models as sf_models
 from neuralforecast import NeuralForecast, models as nf_models
@@ -41,6 +43,8 @@ class Pipeline(ABC):
         self.freq = config.freq
 
         self.h = config.h
+        self.boxcox = config.boxcox
+        self.boxcox_lambda = None
         self.models = config.models
         self.checkpoint_path = config.checkpoint_path
 
@@ -90,12 +94,10 @@ class Pipeline(ABC):
         }
 
     @abstractmethod
-    @cached_property
-    def _fit_kwargs(self) -> dict[str, Any]: ...
+    def _get_fit_kwargs(self) -> dict[str, Any]: ...
 
     @abstractmethod
-    @cached_property
-    def _predict_kwargs(self) -> dict[str, Any]: ...
+    def _get_predict_kwargs(self, data) -> dict[str, Any]: ...
 
     def read_data(
         self,
@@ -113,6 +115,8 @@ class Pipeline(ABC):
             raise NotImplementedError('Only CSV and parquet supported')
 
         self.logger.info('Data shape after reading: %s', data.shape)
+        self.logger.info('N timestamps: %s', data[self.date_column].n_unique())
+        self.logger.info('N ids: %s', data[self.id_column].n_unique())
         return data
 
 
@@ -126,6 +130,12 @@ class Pipeline(ABC):
             self._target_column_alias,
             *self.feature_columns
         )
+
+        if self.boxcox:
+            y_np = data[self._target_column_alias].to_numpy()
+            y_np, self.boxcox_lambda = boxcox(y_np + 1e-8)
+            data = data.with_columns(pl.Series(name=self._target_column_alias, values=y_np))
+
         self.logger.info('Data shape after processing: %s', data.shape)
         return data
 
@@ -146,7 +156,7 @@ class Pipeline(ABC):
             )
             return train_df, None
 
-        split_date = pl.lit(max_date).dt.offset_by(f'-{self.h}{self.freq}')
+        split_date = pl.lit(max_date).dt.offset_by(f'-{self.h}{self.freq[1:]}')
 
         train_df = df.filter(
             (pl.col(self._date_column_alias) > pd.to_datetime(min_date)) &
@@ -174,15 +184,19 @@ class Pipeline(ABC):
             for model in self.models
         ]
         forecaster = self._forecaster_class(models=models, freq=self.freq)
-        forecaster.fit(data, **self._fit_kwargs)
+        forecaster.fit(data, **self._get_fit_kwargs())
         self._fitted = True
         return forecaster
 
-    def predict(self, forecaster: StatsForecast) -> pl.DataFrame:
+    def predict(self, forecaster: StatsForecast, test_data: pl.DataFrame | None) -> pl.DataFrame:
         self.logger.info('Predicting with horizon %s', self.h)
         if not self._fitted:
             raise RuntimeError(f'Pipeline is not fitted')
-        predict = forecaster.predict(**self._predict_kwargs)
+        predict = forecaster.predict(**self._get_predict_kwargs(test_data))
+
+        predict = predict.join(
+            test_data.select(self._id_column_alias, self._date_column_alias, self._target_column_alias),
+            on=[self._id_column_alias, self._date_column_alias])
         return predict
 
     @staticmethod
@@ -205,11 +219,12 @@ class Pipeline(ABC):
         )
 
         metrics_list: list[dict[str, Any]] = []
-        pred_columns: list[str] = list(set(y_pred.columns) - {self._id_column_alias, self._date_column_alias})
+        id_cols = {self._id_column_alias, self._date_column_alias, self._target_column_alias}
+        pred_columns: list[str] = list(set(y_pred.columns) - id_cols)
 
         for model_name in pred_columns:
             y = joined[self._target_column_alias].to_numpy()
-            y_hat = joined[model_name].to_numpy()
+            y_hat = joined[model_name].fill_nan(0).to_numpy()
             model_metrics = {'model': model_name}
             for metric_name in self.metric_names:
                 metric_fn = getattr(sklearn_metrics, metric_name)
@@ -218,6 +233,23 @@ class Pipeline(ABC):
             metrics_list.append(model_metrics)
 
         return pl.DataFrame(metrics_list)
+
+    def process_predictions(self, predictions: pl.DataFrame) -> pl.DataFrame:
+        if self.boxcox_lambda is None:
+            return predictions
+
+        pred_columns = [
+            c for c in predictions.columns
+            if c not in {self._id_column_alias, self._date_column_alias}
+        ]
+
+        for col in pred_columns:
+            predictions = predictions.with_columns(
+                pl.col(col).map_elements(
+                    lambda x: float(inv_boxcox(x + 1e-8, self.boxcox_lambda)), return_dtype=float
+                )
+            )
+        return predictions
 
     def save_artifacts(
         self,
@@ -244,10 +276,19 @@ class Pipeline(ABC):
         else:
             forecaster = self.fit(train_df)
 
-        predict = self.predict(forecaster)
+        predict = self.predict(forecaster, test_df)
+        predict = self.process_predictions(predict)
 
         metrics = None
         if self.mode == 'valid':
+            # Inverse transform ground‑truth targets for fair comparison
+            if self.boxcox_lambda is not None:
+                test_df = test_df.with_columns(
+                    pl.col(self._target_column_alias)
+                    .map_elements(
+                        lambda x, lmbda=self.boxcox_lambda: float(inv_boxcox(x, lmbda))
+                    ).alias(self._target_column_alias)
+                )
             metrics = self.calc_metrics(test_df, predict)
             self.logger.info('Prediction metrics')
             self.logger.info("\n%s", metrics.to_pandas().to_markdown(index=False))
@@ -260,13 +301,18 @@ class StatsForecastPipeline(Pipeline):
     _forecaster_class = StatsForecast
     _models_lib = sf_models
 
-    @cached_property
-    def _fit_kwargs(self) -> dict[str, Any]:
+    def _get_fit_kwargs(self) -> dict[str, Any]:
         return {}
 
-    @cached_property
-    def _predict_kwargs(self) -> dict[str, Any]:
-        return {'h': self.h}
+
+    def _get_predict_kwargs(self, data) -> dict[str, Any]:
+        kwargs_dict = {'h': self.h}
+        if self.feature_columns:
+            if self.mode == 'valid':
+                kwargs_dict['X_df'] = data[self._id_column_alias, self._date_column_alias, *self.feature_columns]
+            else:
+                raise RuntimeError('Inference mode with exogenous features is not supported for Statforecast models')
+        return kwargs_dict
 
     @staticmethod
     def load(path: Path) -> StatsForecast:
@@ -277,12 +323,10 @@ class NeuralForecastPipeline(Pipeline):
     _forecaster_class = NeuralForecast
     _models_lib = nf_models
 
-    @cached_property
-    def _fit_kwargs(self) -> dict[str, Any]:
+    def _get_fit_kwargs(self) -> dict[str, Any]:
         return {'val_size': self.h}
 
-    @cached_property
-    def _predict_kwargs(self) -> dict[str, Any]:
+    def _get_predict_kwargs(self, data) -> dict[str, Any]:
         return {}
 
     @staticmethod
