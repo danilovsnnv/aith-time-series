@@ -1,19 +1,27 @@
 from __future__ import annotations
 
+import logging
 from functools import cached_property
+from abc import ABC, abstractmethod
 
 import pandas as pd
 import polars as pl
 from typing import Any
 from pathlib import Path
-
+from scipy.stats import boxcox
+from scipy.special import inv_boxcox
 from sklearn import metrics as sklearn_metrics
 from statsforecast import StatsForecast, models as sf_models
+from neuralforecast import NeuralForecast, models as nf_models
 
 from src.config import PipelineConfig
+from datetime import datetime
 
 
-class Pipeline:
+class Pipeline(ABC):
+    _forecaster_class: Any = None
+    _models_lib: Any = None
+
     def __init__(
         self,
         config: PipelineConfig,
@@ -21,7 +29,10 @@ class Pipeline:
         if isinstance(config.data_path, str):
             config.data_path = Path(config.data_path)
 
-        self.data_path = config.data_path
+        if isinstance(config.checkpoint_path, str):
+            config.checkpoint_path = Path(config.checkpoint_path)
+
+        self.data_path = Path(config.data_path)
         self.id_column = config.id_column
         self.date_column = config.date_column
         self.target_column = config.target_column
@@ -32,12 +43,30 @@ class Pipeline:
         self.freq = config.freq
 
         self.h = config.h
+        self.boxcox = config.boxcox
+        self.boxcox_lambda = None
         self.models = config.models
+        self.checkpoint_path = config.checkpoint_path
 
+        self.log_dir = Path(config.log_dir)
+        experiment_name = f'{self._forecaster_class.__name__.lower()}_experiment_{datetime.now().strftime("%Y%m%d-%H%M%S")}'
+        self.experiment_dir = self.log_dir / experiment_name
+        self.experiment_dir.mkdir(parents=True, exist_ok=True)
+
+        log_file = self.experiment_dir / 'pipeline.log'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[%(asctime)s | %(levelname)s | %(name)s] %(message)s',
+            handlers=[
+                logging.FileHandler(log_file, mode='a'),
+                logging.StreamHandler()
+            ],
+        )
+        self.logger = logging.getLogger(self.__class__.__name__)
+        config.to_yaml(self.experiment_dir / 'config.yaml')
+
+        self.mode = config.mode
         self.metric_names = config.metric_names or ['mean_absolute_percentage_error']
-
-        if isinstance(self.models, str):
-            self.models = [self.models]
 
         if isinstance(self.metric_names, str):
             self.metric_names = [self.metric_names]
@@ -64,18 +93,17 @@ class Pipeline:
             self.target_column: self._target_column_alias,
         }
 
-    @classmethod
-    def from_config(cls, config: PipelineConfig) -> Pipeline:
-        return Pipeline(config)
+    @abstractmethod
+    def _get_fit_kwargs(self) -> dict[str, Any]: ...
 
-    @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> Pipeline:
-        return Pipeline(PipelineConfig(**config))
+    @abstractmethod
+    def _get_predict_kwargs(self, data) -> dict[str, Any]: ...
 
     def read_data(
         self,
         filters: dict[str, Any] | None = None,
     ) -> pl.DataFrame:
+        self.logger.info('Reading data from %s', self.data_path)
         if self.data_path.suffix == '.csv':
             data = pl.read_csv(self.data_path)
         elif self.data_path.suffix == '.parquet':
@@ -86,10 +114,14 @@ class Pipeline:
         else:
             raise NotImplementedError('Only CSV and parquet supported')
 
+        self.logger.info('Data shape after reading: %s', data.shape)
+        self.logger.info('N timestamps: %s', data[self.date_column].n_unique())
+        self.logger.info('N ids: %s', data[self.id_column].n_unique())
         return data
 
 
     def process_data(self, data):
+        self.logger.info('Processing data')
         data = data.with_columns(pl.col(self.date_column).cast(pl.Date))
         data = data.rename(self._rename_dict)
         data = data.select(
@@ -98,13 +130,33 @@ class Pipeline:
             self._target_column_alias,
             *self.feature_columns
         )
+
+        if self.boxcox:
+            y_np = data[self._target_column_alias].to_numpy()
+            y_np, self.boxcox_lambda = boxcox(y_np + 1e-8)
+            data = data.with_columns(pl.Series(name=self._target_column_alias, values=y_np))
+
+        self.logger.info('Data shape after processing: %s', data.shape)
         return data
 
-    def train_test_split(self, df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    def train_test_split(self, df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame | None]:
+        self.logger.info('Splitting data into train and test sets')
         min_date = self.min_date or df[self._date_column_alias].min()
         max_date = self.max_date or df[self._date_column_alias].max()
 
-        split_date = pl.lit(max_date).dt.offset_by(f'-{self.h}{self.freq}')
+        if self.mode == 'inference':
+            train_df = df.filter(
+                (pl.col(self._date_column_alias) > pd.to_datetime(min_date)) &
+                (pl.col(self._date_column_alias) <= pd.to_datetime(max_date))
+            )
+            self.logger.info(
+                'Train shape: %s, Test shape: %s',
+                train_df.shape,
+                None,
+            )
+            return train_df, None
+
+        split_date = pl.lit(max_date).dt.offset_by(f'-{self.h}{self.freq[1:]}')
 
         train_df = df.filter(
             (pl.col(self._date_column_alias) > pd.to_datetime(min_date)) &
@@ -114,48 +166,65 @@ class Pipeline:
             (pl.col(self._date_column_alias) > split_date) &
             (pl.col(self._date_column_alias) <= pd.to_datetime(max_date))
         )
+        self.logger.info(
+            'Train shape: %s, Test shape: %s',
+            train_df.shape,
+            None if test_df is None else test_df.shape,
+        )
 
         return train_df, test_df
 
-    def fit(self, data: pl.DataFrame) -> StatsForecast:
+    def fit(self, data: pl.DataFrame):
+        self.logger.info('Fitting models: %s', [model['name'] for model in self.models])
         if self._fitted:
-            raise RuntimeError(f'Pipeline is already fitted')
-        models = [getattr(sf_models, model_name)() for model_name in self.models]
-        forecaster = StatsForecast(models=models, freq=self.freq)
-        forecaster.fit(data)
+            raise RuntimeError('Pipeline is already fitted')
+
+        models = [
+            getattr(self._models_lib, model['name'])(**model.get('params', {}))
+            for model in self.models
+        ]
+        forecaster = self._forecaster_class(models=models, freq=self.freq)
+        forecaster.fit(data, **self._get_fit_kwargs())
         self._fitted = True
         return forecaster
 
-    def predict(self, forecaster: StatsForecast) -> pl.DataFrame:
+    def predict(self, forecaster: StatsForecast, test_data: pl.DataFrame | None) -> pl.DataFrame:
+        self.logger.info('Predicting with horizon %s', self.h)
         if not self._fitted:
             raise RuntimeError(f'Pipeline is not fitted')
-        predict = forecaster.predict(h=self.h)
+        predict = forecaster.predict(**self._get_predict_kwargs(test_data))
+
+        predict = predict.join(
+            test_data.select(self._id_column_alias, self._date_column_alias, self._target_column_alias),
+            on=[self._id_column_alias, self._date_column_alias])
         return predict
 
     @staticmethod
-    def save(forecaster: StatsForecast, path: str | Path) -> None:
-        forecaster.save(path)
+    def save(forecaster, path: str | Path) -> None:
+        forecaster.save(str(path))
 
     @staticmethod
-    def load(path: Path) -> StatsForecast:
-        return StatsForecast.load(path)
+    @abstractmethod
+    def load(path: Path): ...
 
     def calc_metrics(
         self,
         y_true: pl.DataFrame,
         y_pred: pl.DataFrame,
     ) -> pl.DataFrame:
+        self.logger.info('Calculating metrics')
         joined = y_true.join(
             y_pred,
             on=[self._id_column_alias, self._date_column_alias],
         )
 
         metrics_list: list[dict[str, Any]] = []
-        pred_columns: list[str] = list(set(y_pred.columns) - {self._id_column_alias, self._date_column_alias})
+        id_cols = {self._id_column_alias, self._date_column_alias, self._target_column_alias}
+        pred_columns: list[str] = list(set(y_pred.columns) - id_cols)
 
         for model_name in pred_columns:
             y = joined[self._target_column_alias].to_numpy()
-            y_hat = joined[model_name].to_numpy()
+            y_hat = joined[model_name].fill_nan(0).to_numpy()
             model_metrics = {'model': model_name}
             for metric_name in self.metric_names:
                 metric_fn = getattr(sklearn_metrics, metric_name)
@@ -165,11 +234,101 @@ class Pipeline:
 
         return pl.DataFrame(metrics_list)
 
+    def process_predictions(self, predictions: pl.DataFrame) -> pl.DataFrame:
+        if self.boxcox_lambda is None:
+            return predictions
+
+        pred_columns = [
+            c for c in predictions.columns
+            if c not in {self._id_column_alias, self._date_column_alias}
+        ]
+
+        for col in pred_columns:
+            predictions = predictions.with_columns(
+                pl.col(col).map_elements(
+                    lambda x: float(inv_boxcox(x + 1e-8, self.boxcox_lambda)), return_dtype=float
+                )
+            )
+        return predictions
+
+    def save_artifacts(
+        self,
+        predict: pl.DataFrame,
+        forecaster: StatsForecast,
+        metrics: pl.DataFrame | None = None,
+    ) -> None:
+        self.logger.info('Saving artifacts to %s', self.experiment_dir)
+        predict.write_parquet(self.experiment_dir / 'prediction.parquet')
+
+        if metrics is not None:
+            metrics.write_csv(self.experiment_dir / 'metrics.csv')
+
+        if not self.checkpoint_path:
+            self.save(forecaster, self.experiment_dir / 'forecaster.pk')
+
     def run(self):
+        self.logger.info('Starting pipeline run in "%s" mode', self.mode)
         data = self.read_data()
         data = self.process_data(data)
         train_df, test_df = self.train_test_split(data)
-        forecaster = self.fit(train_df)
-        predict = self.predict(forecaster)
-        metrics = self.calc_metrics(test_df, predict)
-        print(metrics)
+        if self.checkpoint_path:
+            forecaster = self.load(self.checkpoint_path)
+        else:
+            forecaster = self.fit(train_df)
+
+        predict = self.predict(forecaster, test_df)
+        predict = self.process_predictions(predict)
+
+        metrics = None
+        if self.mode == 'valid':
+            # Inverse transform ground‑truth targets for fair comparison
+            if self.boxcox_lambda is not None:
+                test_df = test_df.with_columns(
+                    pl.col(self._target_column_alias)
+                    .map_elements(
+                        lambda x, lmbda=self.boxcox_lambda: float(inv_boxcox(x, lmbda))
+                    ).alias(self._target_column_alias)
+                )
+            metrics = self.calc_metrics(test_df, predict)
+            self.logger.info('Prediction metrics')
+            self.logger.info("\n%s", metrics.to_pandas().to_markdown(index=False))
+
+        self.save_artifacts(predict, forecaster, metrics)
+        self.logger.info('Pipeline run completed')
+
+
+class StatsForecastPipeline(Pipeline):
+    _forecaster_class = StatsForecast
+    _models_lib = sf_models
+
+    def _get_fit_kwargs(self) -> dict[str, Any]:
+        return {}
+
+
+    def _get_predict_kwargs(self, data) -> dict[str, Any]:
+        kwargs_dict = {'h': self.h}
+        if self.feature_columns:
+            if self.mode == 'valid':
+                kwargs_dict['X_df'] = data[self._id_column_alias, self._date_column_alias, *self.feature_columns]
+            else:
+                raise RuntimeError('Inference mode with exogenous features is not supported for Statforecast models')
+        return kwargs_dict
+
+    @staticmethod
+    def load(path: Path) -> StatsForecast:
+        return StatsForecast.load(path)
+
+
+class NeuralForecastPipeline(Pipeline):
+    _forecaster_class = NeuralForecast
+    _models_lib = nf_models
+
+    def _get_fit_kwargs(self) -> dict[str, Any]:
+        return {'val_size': self.h}
+
+    def _get_predict_kwargs(self, data) -> dict[str, Any]:
+        return {}
+
+    @staticmethod
+    def load(path: Path) -> NeuralForecast:
+        return NeuralForecast.load(str(path))

@@ -1,0 +1,32 @@
+h: 30
+mode: 'valid'
+models:
+  - name: 'ARIMA'
+    params:
+      season_length: 7
+      order: [2, 2, 1]
+      seasonal_order: [1, 1, 1]
+      blambda: null
+      biasadj: True
+  - name: 'MSTL'
+    params:
+      season_length: [7, 30, 90]
+  - name: 'HoltWinters'
+    params:
+      season_length: 7
+  - name: 'WindowAverage'
+    params:
+      window_size: 7
+      alias: 'WeekAverage'
+boxcox: False
+
+data_path: ../data/store1_data.csv
+log_dir: ../logs
+id_column: item_id
+date_column: date_id
+target_column: cnt
+features_columns: []
+min_date: null
+max_date: null
+metric_names: ['mean_absolute_error', 'mean_absolute_percentage_error']
+freq: 1d
