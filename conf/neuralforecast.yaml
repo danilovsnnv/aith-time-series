@@ -1,9 +1,9 @@
-h: 30
+h: 7
 mode: 'valid'
 models:
   - name: 'NBEATS'
     params:
-      h: 30
+      h: 7
       input_size: 60
       max_steps: 500
       early_stop_patience_steps: 5
@@ -14,7 +14,7 @@ models:
 
   - name: 'KAN'
     params:
-      h: 30
+      h: 7
       input_size: 60
       max_steps: 500
       early_stop_patience_steps: 5
@@ -35,7 +35,7 @@ models:
 #      windows_batch_size: null
 #      scaler_type: robust
 
-data_path: ../data/shop_sales.csv
+data_path: ../data/store1_data.csv
 log_dir: ../logs
 id_column: item_id
 date_column: date_id
